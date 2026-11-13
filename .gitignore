@@ -1,0 +1,40 @@
+# Databricks / Spark
+.databricks/
+databricks.yml.local
+*.dbc
+spark-warehouse/
+metastore_db/
+derby.log
+
+# Datos generados localmente
+*.jsonl
+*.csv
+*.parquet
+landing_ads/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+
+# Credenciales
+*.pem
+*.key
+.databrickscfg
+
+# IDE / SO
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Agentes / herramientas locales
+.claude/
+.atl/
+odd/
