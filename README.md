@@ -1,23 +1,21 @@
-# Pipeline de datos de publicidad digital en Databricks (capa Bronze)
+# Pipeline medallion de publicidad digital en Databricks (Bronze → Silver → Gold)
 
-Ingesta incremental de datos sintéticos de AdTech (6 entidades, 1 día de eventos por corrida) a tablas Delta en Unity Catalog, usando Volumes + `COPY INTO`. Proyecto de formación como data engineer en Databricks (TP integrador, UTN).
-
-> Estado: **Bronze completo**. Silver y Gold están planificadas (ver [Limitaciones y próximos pasos](#limitaciones-y-próximos-pasos)).
+Pipeline de datos sobre datos sintéticos de AdTech (advertisers, campaigns, ads, impressions, clicks, conversions; 30 días de octubre 2026 más 2 días de noviembre) con ingesta `COPY INTO`, limpieza en Silver y 8 tablas Gold que responden preguntas de negocio. Proyecto de formación como data engineer en Databricks (TP integrador, UTN).
 
 ## Hallazgos clave
 
-- **`COPY INTO` es idempotente por archivo**: re-ejecutar el notebook de ingesta sobre los mismos archivos no duplica filas; la verificación final coincide con lo aterrizado (200 / 2.000 / 500.000 / 5.023 / 100 / 8 filas en la corrida del 2026-11-08).
-- **Bronze conserva todos los defectos de calidad del origen, sin corregirlos**: 5.023 impressions para 5.000 generadas (**~0,5%** duplicadas), **1%** de ads sin `creative_url`, **1%** de campañas con presupuesto 0, **2%** de websites sin protocolo.
-- **Hay claves huérfanas por diseño**: **0,5%** de clicks apuntan a `impression_id = 9999999` y **1%** de conversions a `click_id = 8888888`, que no existen en sus tablas padre.
-- **Las dimensiones se reescriben completas en cada corrida** (500.000 ads por archivo). Con un archivo nuevo por fecha, `COPY INTO` lo trata como archivo nuevo y vuelve a cargar los 500.000 ads (detalle en Limitaciones).
+- **Los ids de eventos no son únicos entre archivos**: el generador reinicia el contador en cada archivo, así que impressions tiene **150.000 ids distintos para 160.000 eventos reales**. Deduplicar por `id` habría borrado 10.000 eventos; Silver usa un `event_key` (hash de todos los campos).
+- **Bronze cargó las dimensiones varias veces**: 600 filas para 200 advertisers, 6.000 para 2.000 campañas y 1.500.000 para 500.000 ads (una carga por archivo aterrizado). Silver las deja en 1 fila por `id`.
+- **El pipeline cierra de punta a punta**: 160.000 impresiones, 3.184 clics y 256 conversiones en Silver; CTR global **1,99%** y CVR global **8,04%**, los valores con los que se diseñó el generador (2% y 8%).
+- **El 95% de las campañas (1.903 de 2.000) no tiene ninguna conversión** y concentra el **92,5%** del gasto ($6.084,46 de $6.576,23). Solo Retail recupera más de lo que gasta (ROAS **1,52**; global 0,89).
 
 ## Resumen ejecutivo
 
-Trabajo de práctica para consolidar el flujo de ingesta en Databricks: un notebook genera datos crudos del dominio publicidad digital y otro los aterriza como JSON Lines en un Volume y los carga a Bronze. Ambos son parametrizables por rango de fechas, así que sirven tanto para la carga diaria como para un backfill.
+Trabajo de práctica para recorrer una arquitectura medallion completa en Databricks con Unity Catalog. Se generan datos crudos, se ingestan sin transformar a Bronze, se limpian y se les da integridad referencial en Silver, y se agregan en Gold para responder 8 preguntas de negocio.
 
 ## Problema
 
-Los datos de origen llegan con defectos (duplicados, claves huérfanas, nulos, valores en cero). Si la capa Bronze los "arregla" al ingerir, se pierde la trazabilidad de qué llegó realmente y no se puede reprocesar con otras reglas. El desafío de esta etapa es **ingerir sin transformar** y dejar los defectos documentados para que Silver los trate con reglas explícitas.
+Los datos de origen traen duplicados, claves huérfanas, nulos, valores en cero e ids que se repiten entre archivos. Si se limpian al ingerir se pierde trazabilidad; si no se limpian, las métricas de negocio salen infladas o con atribuciones equivocadas (un clic puede apuntar a dos impresiones distintas con el mismo `id`).
 
 ## Dominio de negocio
 
@@ -30,96 +28,110 @@ Advertiser → Campaign → Ad → Impression → Click → Conversion
 1. Un **advertiser** (empresa) quiere promocionar un producto.
 2. Crea **campaigns** con objetivo, canal (Search, Social, Display, Video) y presupuesto diario.
 3. Cada campaña tiene **ads** (creatividades: Banner, Video, Native, SearchText).
-4. Cuando se muestra un anuncio a un usuario se registra una **impression**.
+4. Cuando se muestra un anuncio se registra una **impression**.
 5. Si el usuario hace clic, se registra un **click** (subconjunto de impressions).
-6. Si luego realiza una acción valiosa (compra, registro), se registra una **conversion** (subconjunto de clicks).
+6. Si luego realiza una acción valiosa, se registra una **conversion** (subconjunto de clicks).
 
-Volúmenes por día en el generador: 5.000 impressions (1% de los ads), 100 clicks (CTR 2%) y 8 conversions (CVR 8%).
+El modelo completo está documentado en `00_ads_data_generator.ipynb`. El generador produce 5.000 impressions por día (1% de los 500.000 ads), 100 clicks (CTR 2%) y 8 conversions (CVR 8%).
 
 ## Objetivo
 
-Ingerir las 6 entidades del dominio en tablas Delta Bronze de forma incremental, parametrizable por fecha y sin duplicar datos al re-ejecutar.
+Construir un pipeline Bronze → Silver → Gold idempotente, que responda 8 preguntas de negocio sobre inversión, embudo y retorno de las campañas.
 
 ## Enfoque técnico
 
-1. **Generación** (`00_ads_data_generator`): funciones `get_*` deterministas (seed fija) que devuelven `list[dict]` con defectos inyectados a propósito.
-2. **Parametrización** (`02_ingesta_bronze_ads`): widgets `base_path`, `start_date`, `end_date`. Ambas fechas vacías = ayer (UTC); una sola = ese día; las dos = rango inclusivo.
-3. **Aterrizaje**: cada entidad se escribe como `.jsonl` en `/Volumes/dev/bronze_ads/landing_ads/<entidad>/<entidad>_<fecha>.jsonl`.
-4. **Ingesta**: `CREATE TABLE IF NOT EXISTS` sin columnas + `COPY INTO ... FILEFORMAT = JSON` hacia `dev.bronze_ads.bronze_<entidad>`.
-5. **Verificación**: `UNION ALL` de `COUNT(*)` por tabla, para comparar contra los registros aterrizados.
+1. **Setup** (`01`): catálogo `dev`, schema `bronze_ads` y Volume `landing_ads`.
+2. **Generación y aterrizaje** (`00` + `02`): datos sintéticos en JSON Lines, parametrizables por rango de fechas.
+3. **Bronze** (`02`): `COPY INTO` incremental hacia `dev.bronze_ads.bronze_*`, sin transformar.
+4. **Silver dimensiones** (`03`): dedup por `id`, normalización y nulos explícitos, en `dev.silver_ads`.
+5. **Silver eventos** (`04`): `event_key`, tipos de fecha e integridad en cascada impressions → clicks → conversions.
+6. **Gold** (`05`, `06`): tablas puente de atribución y una tabla por pregunta en `dev.gold_ads`, con joins, funciones de ventana y columnas derivadas.
+7. **Verificación**: cada notebook cierra con una celda que contrasta sus totales contra la capa anterior.
 
 ## Decisiones técnicas relevantes
 
-### JSON Lines como formato de aterrizaje
-Un registro por línea, mismo formato para las 6 entidades. `COPY INTO` lo lee sin configuración extra, y se puede escribir en streaming sin cargar todo en memoria.
-
-### `COPY INTO` en lugar de un `INSERT`/`overwrite`
-`COPY INTO` registra qué archivos ya cargó, por lo que re-ejecutar no duplica. Un `INSERT` o un `append` desde Python tendría que reimplementar ese control.
-
-### Tablas creadas sin columnas
-`CREATE TABLE IF NOT EXISTS` sin schema deja que `COPY INTO` infiera las columnas del JSON en la primera carga. Evita mantener DDL a mano en una capa cuyo contrato es "lo que llegó".
-
-### `mergeSchema` dos veces
-Cumplen funciones distintas:
-- `FORMAT_OPTIONS ('mergeSchema' = 'true')`: unifica el schema entre **archivos de origen** (un archivo nuevo con una columna extra no rompe la lectura).
-- `COPY_OPTIONS ('mergeSchema' = 'true')`: evoluciona el schema de la **tabla destino** (agrega la columna en vez de fallar).
-
-### Fechas validadas al inicio
-`date.fromisoformat` y el chequeo `start_date > end_date` hacen que un error de parámetro falle en la primera celda con un mensaje claro, y no a mitad de la generación.
+### `COPY INTO` y tablas creadas sin columnas (Bronze)
+`COPY INTO` registra qué archivos ya cargó, así que re-ejecutar el mismo archivo no duplica. Las tablas se crean sin columnas para que infiera el schema del JSON en la primera carga. `mergeSchema` aparece dos veces: en `FORMAT_OPTIONS` unifica el schema entre archivos de origen y en `COPY_OPTIONS` evoluciona la tabla destino.
 
 ### Bronze sin limpieza
-Duplicados, huérfanos y nulos se dejan tal cual. La corrección es responsabilidad de Silver, donde las reglas quedan explícitas y reprocesables.
+Duplicados, huérfanos y nulos se dejan tal cual. Así se puede auditar lo que llegó y reprocesar con otras reglas.
+
+### `event_key` en lugar de `id` para los eventos (Silver)
+El `id` se reinicia en cada archivo ingerido. `event_key = xxhash64(todos los campos)` hace que filas idénticas colapsen (dedup) y eventos distintos con el mismo `id` no se pisen.
+
+### `MERGE` por clave en Silver
+Todas las escrituras son `MERGE` por `id` (dimensiones) o `event_key` (eventos). Re-ejecutar N veces deja la tabla igual. Las tablas Silver se crean con schema explícito, para que el contrato de la capa quede escrito y un cambio inesperado en Bronze sea visible.
+
+### Valores en cero pasan a `NULL`
+Un presupuesto de $0 o un costo de impresión de $0 no son hechos reales sino datos faltantes. Se convierten a `NULL` en vez de borrar la fila o inventar un valor. Lo mismo con `creative_url` nulo: no se inventa una URL.
+
+### Integridad en cascada contra Silver, no contra Bronze
+Los clicks se validan contra las impresiones de Silver y las conversiones contra los clicks de Silver. Los 16 clicks huérfanos (`impression_id = 9999999`) se excluyen. La regla se evalúa contra los datos válidos y no contra el valor 9999999 hardcodeado.
+
+### Atribución en tablas puente (Gold)
+Como un `impression_id` puede corresponder a más de una impresión, el clic se atribuye a la impresión con ese id **más cercana en el tiempo, prefiriendo la anterior al clic** (`row_number() OVER (PARTITION BY clic ORDER BY ...) = 1`). Lo mismo de conversión a clic. La regla vive una sola vez en `clicks_atribuidos` y `conversions_atribuidas`; las preguntas solo joinean contra ellas, y por eso quedan consistentes entre sí.
+
+### `CREATE OR REPLACE TABLE` en Gold
+Con ~160.000 eventos, recalcular cada tabla agregada completa es barato y evita lógica incremental. El resultado no depende de corridas anteriores.
+
+### Umbral anti-ruido en Q8
+Solo se rankean países con al menos 500 impresiones. Sin umbral, un país con 3 impresiones y 1 conversión "ganaría" con 33%. (Con los datos actuales ningún país queda fuera.)
 
 ## Resultados principales
 
 | Área analizada | Hallazgo | Interpretación |
 |---|---|---|
-| Idempotencia de la ingesta | Conteos finales = registros aterrizados | `COPY INTO` evita duplicar al re-ejecutar los mismos archivos |
-| `bronze_impressions` | 5.023 filas vs 5.000 generadas | ~0,5% son copias exactas; Silver debe deduplicar por `id` |
-| `bronze_clicks` | 0,5% con `impression_id = 9999999` | Huérfanos: no tienen impression padre |
-| `bronze_conversions` | 1% con `click_id = 8888888` | Huérfanos: no tienen click padre |
-| `bronze_campaigns` | 1% con `daily_budget_usd = 0` | Valor sospechoso, no necesariamente error |
-| `bronze_ads` | 1% con `creative_url` nulo | Creatividades incompletas |
-| `bronze_advertisers` | 2% de websites sin `https://` | Requiere normalización |
+| Q1 Presupuesto por industria/canal | Gaming lidera; Gaming-Social $220.408 diarios (7,27% del total) | Concentración moderada: una distribución pareja daría ~5% por combinación |
+| Q2 Presupuesto usado | Ninguna campaña pasó del 0,79% de su presupuesto | Presupuestos sobredimensionados para el volumen simulado |
+| Q3 CTR por canal | Search 2,118%, Video 1,959%, Social 1,948%, Display 1,941% | CTR casi uniforme entre canales |
+| Q4 CPA por canal | Display $21,79 vs Search $34,07 | Search tiene el mejor CTR pero convierte peor: sus conversiones salen más caras |
+| Q5 Embudo | En los 4 canales la mayor pérdida es impresión → clic (~2%) frente a clic → conversión (6-10%) | El cuello de botella es captar el clic |
+| Q6 ROAS por industria | Retail 1,52; FinTech 0,82; Gaming 0,82; SaaS 0,73; Travel 0,58; global 0,89 | Solo Retail recupera más de lo invertido |
+| Q7 Campañas sin conversión | 1.903 de 2.000 (95%), $6.084,46 = 92,5% del gasto | Esperable con solo 256 conversiones; el gasto sin retorno está repartido parejo entre los 4 canales |
+| Q8 Países | Top por tasa: HN 0,99%, LS 0,87%, TL 0,87%; CPA más barato GR $3,68 | Tasas casi parejas: el generador asigna el país al azar |
 
 ## Estructura del proyecto
 
 ```
 utn-databricks/
-├── README.md                       # este archivo
+├── README.md
 ├── .gitignore
-├── 00_ads_data_generator.ipynb     # genera los datos sintéticos (funciones get_*) y documenta el modelo
-├── 01_create_catalog_schema.ipynb  # crea el catálogo dev, el schema bronze_ads y el Volume landing_ads
-└── 02_ingesta_bronze_ads.ipynb     # aterriza JSONL en el Volume y carga Bronze con COPY INTO
+├── 00_ads_data_generator.ipynb     # generador de datos sintéticos (funciones get_*) y documentación del modelo
+├── 01_create_catalog_schema.ipynb  # catálogo dev, schema bronze_ads y Volume landing_ads
+├── 02_ingesta_bronze_ads.ipynb     # aterriza JSONL en el Volume y carga Bronze con COPY INTO
+├── 03_silver_dimensiones.ipynb     # silver de advertisers, campaigns y ads (dedup, normalización, NULLs)
+├── 04_silver_eventos.ipynb         # silver de impressions, clicks y conversions (event_key, tipos, integridad)
+├── 05_gold_preguntas_1_5.ipynb     # tablas puente de atribución + Q1 a Q5
+└── 06_gold_preguntas_6_8.ipynb     # Q6 (ROAS), Q7 (campañas sin conversión), Q8 (países)
 ```
 
 ## Cómo reproducir
 
 **Requisitos**
-- Workspace de Databricks con Unity Catalog.
-- Permiso para crear catálogos, schemas y Volumes en Unity Catalog (lo hace `01_create_catalog_schema`).
+- Workspace de Databricks con Unity Catalog y permiso para crear catálogos, schemas y Volumes.
 - Librería `faker` (si el cluster no la trae: `%pip install faker`).
 
 **Pasos**
-1. Importá los tres notebooks al mismo directorio del workspace.
-2. Ejecutá `01_create_catalog_schema` una sola vez: crea `dev`, `dev.bronze_ads` y el Volume `landing_ads`.
-3. En `02_ingesta_bronze_ads`, ajustá la primera celda `%run` para que apunte a tu copia de `00_ads_data_generator` (con ambos en la misma carpeta alcanza `%run ./00_ads_data_generator`).
-4. Ejecutá la celda de parámetros. Sin fechas genera ayer (UTC). Para un backfill completá `start_date` y `end_date` (`YYYY-MM-DD`).
-5. Ejecutá la celda de `COPY INTO`.
-6. Ejecutá la celda de verificación y comparala con los conteos impresos en el paso 4.
+1. Importá los 7 notebooks al mismo directorio del workspace.
+2. Ejecutá `01_create_catalog_schema` una sola vez.
+3. En `02_ingesta_bronze_ads`, ajustá el `%run` de la primera celda a la ruta de tu copia de `00_ads_data_generator` (con ambos en la misma carpeta alcanza `%run ./00_ads_data_generator`).
+4. Corré `02_ingesta_bronze_ads` por cada rango de fechas que quieras cargar (widgets `start_date` y `end_date`, formato `YYYY-MM-DD`; vacíos = ayer UTC). Los números de este README salen de un backfill de 30 días de octubre 2026 más 2 corridas de un día en noviembre.
+5. Ejecutá en orden `03`, `04`, `05` y `06`. Cada uno termina con una celda de verificación.
 
-> Las rutas de los Volumes distinguen mayúsculas/minúsculas: respetá `dev.bronze_ads` y `landing_ads` tal cual.
+> Los nombres de catálogo y schema (`dev`, `bronze_ads`, `silver_ads`, `gold_ads`) están escritos en el SQL de los notebooks; si usás otros, hay que reemplazarlos. Los gráficos de Gold son visualizaciones de Databricks y no se renderizan fuera del workspace.
 
 ## Limitaciones y próximos pasos
 
 **Limitaciones**
-- **Dimensiones duplicadas entre días**: `get_advertisers/campaigns/ads` no dependen de la fecha, pero el nombre del archivo sí. Una segunda corrida con otra fecha crea otro archivo y `COPY INTO` carga de nuevo los 500.000 ads. Pendiente de verificar en una segunda corrida; la corrección sería escribir las dimensiones una sola vez o resolverlo en Silver.
-- **IDs de eventos reiniciados**: `id`, `impression_id` y `click_id` se generan desde 1 en cada corrida, así que dos días distintos colisionan en los ids.
-- **Datos sintéticos**: no hay conclusiones de negocio sobre campañas reales.
-- **Sin pruebas automáticas** ni orquestación (los notebooks se corren a mano).
-- **Comentario desactualizado**: en el generador, `IMPRESSION_RATE = 0.01` tiene un comentario que dice 0,05%.
+- **Datos sintéticos y aleatorios**: país, industria y canal se asignan al azar, así que las diferencias entre ellos (ROAS por industria, tasas por país) probablemente sean ruido. No se probó significancia estadística y con 256 conversiones las muestras son chicas.
+- **Atribución heurística**: "impresión más cercana, preferentemente anterior" resuelve la ambigüedad de ids repetidos pero no garantiza que sea la impresión real.
+- **Caso límite aceptado**: 1 conversión apunta a `click_id = 24`, que es a la vez un clic huérfano y dos clics válidos; se conserva porque existe un camino válido.
+- **Dimensiones recargadas en Bronze**: cada archivo nuevo reaterriza las 500.000 filas de ads. Silver lo absorbe con dedup, pero Bronze crece sin necesidad.
+- **IDs de eventos reiniciados por archivo**: obliga a usar `event_key` y a una atribución por tiempo.
+- **Sin orquestación ni tests automáticos**: los notebooks se corren a mano en orden.
+- **Comentario desactualizado** en el generador: `IMPRESSION_RATE = 0.01` tiene un comentario que dice 0,05%.
 
 **Próximos pasos**
-1. Capa **Silver**: deduplicar impressions, tratar huérfanos, normalizar websites, decidir qué hacer con presupuestos en 0 y creatividades nulas.
-2. Capa **Gold**: métricas del embudo (CTR, CVR, costo por conversión) por campaña y canal.
-3. Orquestación con Databricks Workflows y carga diaria programada.
+1. Aterrizar las dimensiones una sola vez (o con nombre de archivo fijo) para evitar recargas en Bronze.
+2. Orquestar `02` a `06` con Databricks Workflows y carga diaria programada.
+3. Agregar tests de calidad de datos (por ejemplo, expectativas sobre unicidad de `event_key` e integridad referencial).
