@@ -1,6 +1,12 @@
 # Pipeline medallion de publicidad digital en Databricks (Bronze → Silver → Gold)
 
-Pipeline de datos sobre datos sintéticos de AdTech (advertisers, campaigns, ads, impressions, clicks, conversions; 30 días de octubre 2026 más 2 días de noviembre) con ingesta `COPY INTO`, limpieza en Silver y 8 tablas Gold que responden preguntas de negocio. Proyecto de formación como data engineer en Databricks (TP integrador, UTN).
+Trabajo sobre datos sintéticos de AdTech (advertisers, campaigns, ads, impressions, clicks, conversions; 30 días de octubre 2026 más 2 días de noviembre), con una arquitectura medallion en Databricks con Unity Catalog. Se generan datos crudos, se ingestan sin transformar a Bronze, se limpian y se les da integridad referencial en Silver, y se agregan en Gold para responder 8 preguntas de negocio sobre inversión, embudo y retorno de las campañas.
+
+## Dashboard interactivo (AI/BI)
+
+El proyecto incluye un **dashboard BI** .
+Link:
+https://dbc-059b48d5-e7d1.cloud.databricks.com/dashboardsv3/01f1e80244e017d5bbf9ca88ab5e1c95/published?o=7474649384340028&f_filtros_globales%7Ecanal_filtro=_all_&f_filtros_globales%7Epais_filtro.s=_all
 
 ## Hallazgos clave
 
@@ -8,10 +14,6 @@ Pipeline de datos sobre datos sintéticos de AdTech (advertisers, campaigns, ads
 - **Bronze cargó las dimensiones varias veces**: 600 filas para 200 advertisers, 6.000 para 2.000 campañas y 1.500.000 para 500.000 ads (una carga por archivo aterrizado). Silver las deja en 1 fila por `id`.
 - **El pipeline cierra de punta a punta**: 160.000 impresiones, 3.184 clics y 256 conversiones en Silver; CTR global **1,99%** y CVR global **8,04%**, los valores con los que se diseñó el generador (2% y 8%).
 - **El 95% de las campañas (1.903 de 2.000) no tiene ninguna conversión** y concentra el **92,5%** del gasto ($6.084,46 de $6.576,23). Solo Retail recupera más de lo que gasta (ROAS **1,52**; global 0,89).
-
-## Resumen ejecutivo
-
-Trabajo de práctica para recorrer una arquitectura medallion completa en Databricks con Unity Catalog. Se generan datos crudos, se ingestan sin transformar a Bronze, se limpian y se les da integridad referencial en Silver, y se agregan en Gold para responder 8 preguntas de negocio.
 
 ## Problema
 
@@ -34,10 +36,6 @@ Advertiser → Campaign → Ad → Impression → Click → Conversion
 
 El modelo completo está documentado en `00_ads_data_generator.ipynb`. El generador produce 5.000 impressions por día (1% de los 500.000 ads), 100 clicks (CTR 2%) y 8 conversions (CVR 8%).
 
-## Objetivo
-
-Construir un pipeline Bronze → Silver → Gold idempotente, que responda 8 preguntas de negocio sobre inversión, embudo y retorno de las campañas.
-
 ## Enfoque técnico
 
 1. **Setup** (`01`): catálogo `dev`, schema `bronze_ads` y Volume `landing_ads`.
@@ -47,6 +45,8 @@ Construir un pipeline Bronze → Silver → Gold idempotente, que responda 8 pre
 5. **Silver eventos** (`04`): `event_key`, tipos de fecha e integridad en cascada impressions → clicks → conversions.
 6. **Gold** (`05`, `06`): tablas puente de atribución y una tabla por pregunta en `dev.gold_ads`, con joins, funciones de ventana y columnas derivadas.
 7. **Verificación**: cada notebook cierra con una celda que contrasta sus totales contra la capa anterior.
+%md
+8. **Visualización** (`AdTech TP Integrador.lvdash.json`): dashboard AI/BI publicado que consume las tablas Gold con SELECTs y responde las 8 preguntas de forma visual e interactiva.
 
 ## Decisiones técnicas relevantes
 
@@ -102,8 +102,12 @@ utn-databricks/
 ├── 03_silver_dimensiones.ipynb     # silver de advertisers, campaigns y ads (dedup, normalización, NULLs)
 ├── 04_silver_eventos.ipynb         # silver de impressions, clicks y conversions (event_key, tipos, integridad)
 ├── 05_gold_preguntas_1_5.ipynb     # tablas puente de atribución + Q1 a Q5
-└── 06_gold_preguntas_6_8.ipynb     # Q6 (ROAS), Q7 (campañas sin conversión), Q8 (países)
+├── 06_gold_preguntas_6_8.ipynb     # Q6 (ROAS), Q7 (campañas sin conversión), Q8 (países)
+└── AdTech TP Integrador.lvdash.json # dashboard AI/BI publicado (consume Gold, solo SELECTs)
 ```
+
+%md
+
 
 ## Cómo reproducir
 
@@ -120,7 +124,6 @@ utn-databricks/
 
 > Los nombres de catálogo y schema (`dev`, `bronze_ads`, `silver_ads`, `gold_ads`) están escritos en el SQL de los notebooks; si usás otros, hay que reemplazarlos. Los gráficos de Gold son visualizaciones de Databricks y no se renderizan fuera del workspace.
 
-## Limitaciones y próximos pasos
 
 **Limitaciones**
 - **Datos sintéticos y aleatorios**: país, industria y canal se asignan al azar, así que las diferencias entre ellos (ROAS por industria, tasas por país) probablemente sean ruido. No se probó significancia estadística y con 256 conversiones las muestras son chicas.
@@ -132,6 +135,5 @@ utn-databricks/
 - **Comentario desactualizado** en el generador: `IMPRESSION_RATE = 0.01` tiene un comentario que dice 0,05%.
 
 **Próximos pasos**
-1. Aterrizar las dimensiones una sola vez (o con nombre de archivo fijo) para evitar recargas en Bronze.
-2. Orquestar `02` a `06` con Databricks Workflows y carga diaria programada.
-3. Agregar tests de calidad de datos (por ejemplo, expectativas sobre unicidad de `event_key` e integridad referencial).
+1. Orquestar `02` a `06` con Databricks Workflows y carga diaria programada.
+2. Agregar tests de calidad de datos (por ejemplo, expectativas sobre unicidad de `event_key` e integridad referencial).
